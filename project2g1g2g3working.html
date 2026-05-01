@@ -1,0 +1,1554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>VR Heist Escape Room</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <style>
+    body { margin: 0; overflow: hidden; background: #111; font-family: Arial, sans-serif; }
+    #info {
+      position: absolute; top: 12px; left: 12px; z-index: 10;
+      color: white; background: rgba(0,0,0,0.55);
+      padding: 12px 14px; border-radius: 8px; line-height: 1.4; max-width: 340px;
+    }
+  </style>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.183.1/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.183.1/examples/jsm/",
+      "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="info">
+    <div><b>VR Heist Escape Room</b></div>
+    <div>WASD / Left stick: Move</div>
+    <div>Trigger: Grab / release objects &amp; fragments</div>
+    <div>Place all gem fragments on the green pedestal to rebuild gem1</div>
+    <div>Grip → start button: Activate jewels</div>
+    <div>Goal: Place all 3 jewels in their slots to open the vault</div>
+  </div>
+
+  <script>delete window.XRWebGLBinding;</script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { VRButton }                 from 'three/addons/webxr/VRButton.js';
+    import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+    import { GLTFLoader }               from 'three/addons/loaders/GLTFLoader.js';
+    import * as CANNON                  from 'cannon-es';
+
+    // ─────────────────────────────────────────────────────────────
+    // Globals
+    // ─────────────────────────────────────────────────────────────
+    let scene, camera, renderer, raycaster;
+    let controller1, controller2;
+    let controllerGrip1, controllerGrip2;
+    let playerRig;
+    let worldRoot, grabbableGroup, buttonGroup, slotGroup, caseGroup, fragmentGroup;
+
+    const intersected = [];
+    const clock       = new THREE.Clock();
+    const loader      = new GLTFLoader();
+
+    let vaultDoor   = null;
+    let startButton = null;
+
+    const gems  = {};
+    const slots = {};
+
+    const GEM_CONFIG = [
+      { gemName: 'gem1', slotName: '1slot', colorName: 'gem1' },
+      { gemName: 'gem2', slotName: '2slot', colorName: 'gem2' },
+      { gemName: 'gem3', slotName: '3slot', colorName: 'gem3' },
+    ];
+
+    const gameState = {
+      puzzleSolved: { gem1: false, gem2: false, gem3: false },
+      jewelsPlaced: { gem1: false, gem2: false, gem3: false },
+      doorUnlocked: false
+    };
+
+    // ── gem3 case ref ──
+    let gem3CaseObj = null;
+
+    // ── Lockbox / padlock (gem2) ──
+    const LOCKBOX_CODE    = '1745';   // ← change to update the code
+    let lockboxObj        = null;
+    let lockboxOpen       = false;
+    let lockboxUIVisible  = false;
+    let lockboxInput      = '';
+
+    // WASD
+    const keys = { w: false, a: false, s: false, d: false };
+    const MOVE_SPEED = 2.5;
+
+    // ─────────────────────────────────────────────────────────────
+    // Physics
+    // ─────────────────────────────────────────────────────────────
+    let physicsWorld;
+
+    // Array of { mesh: THREE.Object3D, body: CANNON.Body }
+    const physFragments = [];
+
+    // Static body for the vault door (needs per-frame sync during open animation)
+    let vaultDoorBody = null;
+
+    // ── Fragment reconstruction puzzle ──
+    let pedestalWorldPos = null;      // world-space centre of the start pedestal top
+    let pedestalRingMesh = null;      // glowing green ring on the pedestal
+    const PEDESTAL_SNAP_RADIUS = 0.5; // how close to drop before snapping
+    const TOTAL_FRAGMENTS = 10;
+    let deposited = 0;                // how many fragments have been placed
+    let reconstructionDone = false;
+    let ringPulseTime = 0;
+    let groundBody = null;  // repositioned after GLB loads
+
+    // Physics body that drives the player (prevents walking through walls)
+    let playerBody = null;
+    const PLAYER_RADIUS = 0.3;
+    const PLAYER_HEIGHT = 1.7;
+
+    // Per-controller velocity tracking for throw impulse
+    const ctrlPrevPos = [new THREE.Vector3(), new THREE.Vector3()];
+    const ctrlCurrPos = [new THREE.Vector3(), new THREE.Vector3()];
+    const ctrlVel     = [new THREE.Vector3(), new THREE.Vector3()];
+
+    // All 10 fragment names from Blender
+    const FRAGMENT_NAMES = [
+      'gem1_cell',
+      'gem1_cell001', 'gem1_cell002', 'gem1_cell003', 'gem1_cell004',
+      'gem1_cell005', 'gem1_cell006', 'gem1_cell007', 'gem1_cell008', 'gem1_cell009'
+    ];
+
+    // ─────────────────────────────────────────────────────────────
+    // Boot
+    // ─────────────────────────────────────────────────────────────
+    init();
+
+    function init() {
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x10131a);
+
+      playerRig = new THREE.Group();
+      scene.add(playerRig);
+
+      camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+      camera.position.set(0, 1.6, 8);
+      playerRig.add(camera);
+
+      raycaster = new THREE.Raycaster();
+
+      initPhysics();
+      setupLighting();
+      setupGroups();
+      setupRenderer();
+      setupControllers();
+      setupKeyboard();
+      loadProjectMockup();
+
+      window.addEventListener('resize', onWindowResize);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Physics world setup
+    // ─────────────────────────────────────────────────────────────
+    function initPhysics() {
+      physicsWorld = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
+      physicsWorld.broadphase = new CANNON.SAPBroadphase(physicsWorld);
+      physicsWorld.allowSleep = true;
+
+      physicsWorld.defaultContactMaterial.restitution = 0.1;
+      physicsWorld.defaultContactMaterial.friction    = 0.4;
+
+      // Ground plane — Y position set after GLB loads (see setGroundY)
+      groundBody = new CANNON.Body({ mass: 0 });
+      groundBody.addShape(new CANNON.Plane());
+      groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+      groundBody.position.y = 0;
+      physicsWorld.addBody(groundBody);
+
+      // Player body: cylinder approximated as sphere-capped cylinder
+      // fixedRotation=true so physics never tips the player over
+      playerBody = new CANNON.Body({
+        mass: 80,
+        fixedRotation: true,
+        linearDamping: 0.99,   // high damping → snappy stop when keys released
+        angularDamping: 1.0,
+      });
+      // Sphere at foot + sphere at head gives capsule-like feel without needing a real capsule
+      playerBody.addShape(new CANNON.Sphere(PLAYER_RADIUS), new CANNON.Vec3(0, PLAYER_RADIUS, 0));
+      playerBody.addShape(new CANNON.Sphere(PLAYER_RADIUS), new CANNON.Vec3(0, PLAYER_HEIGHT - PLAYER_RADIUS, 0));
+      // Place the player at the camera's initial world position
+      const initPos = new THREE.Vector3();
+      camera.getWorldPosition(initPos);
+      playerBody.position.set(initPos.x, 0, initPos.z);
+      physicsWorld.addBody(playerBody);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Helper: create a mass-0 Box body matched to a Three.js object's
+    // world-space AABB. Works for any mesh or group after GLB is placed.
+    // ─────────────────────────────────────────────────────────────
+    /**
+     * Register a static (mass=0) physics body for every Mesh found inside
+     * threeObj. For a group like "walls" this creates one tight Box per face
+     * mesh rather than one huge AABB around the entire room.
+     * Returns an array of added bodies (or a single body for a lone mesh).
+     */
+    function makeStaticBodies(threeObj) {
+      threeObj.updateWorldMatrix(true, true);
+
+      const bodies = [];
+
+      // Collect leaf meshes (skip empties / non-mesh nodes)
+      const meshes = [];
+      threeObj.traverse(obj => { if (obj.isMesh) meshes.push(obj); });
+      if (meshes.length === 0) {
+        console.warn('makeStaticBodies: no meshes in', threeObj.name);
+        return bodies;
+      }
+
+      meshes.forEach(mesh => {
+        mesh.updateWorldMatrix(true, false);
+        const box = new THREE.Box3().setFromObject(mesh);
+        if (box.isEmpty()) return;
+
+        const size   = new THREE.Vector3();
+        const center = new THREE.Vector3();
+        box.getSize(size);
+        box.getCenter(center);
+
+        const hx = Math.max(size.x / 2, 0.02);
+        const hy = Math.max(size.y / 2, 0.02);
+        const hz = Math.max(size.z / 2, 0.02);
+
+        const body = new CANNON.Body({ mass: 0 });
+        body.addShape(new CANNON.Box(new CANNON.Vec3(hx, hy, hz)));
+        body.position.set(center.x, center.y, center.z);
+        // Identity quaternion — AABB is already axis-aligned in world space
+        physicsWorld.addBody(body);
+        bodies.push(body);
+      });
+
+      console.log(`makeStaticBodies: ${bodies.length} body/bodies for "${threeObj.name}"`);
+      return bodies;
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // GLB loading
+    // ─────────────────────────────────────────────────────────────
+    function loadProjectMockup() {
+      loader.load('./Project2v8.glb', (gltf) => {
+        const root = gltf.scene;
+        worldRoot.add(root);
+        root.scale.set(0.6, 0.6, 0.6);
+
+        // Step 1: measure AABB with scale applied but position still at origin
+        root.position.set(0, 0, 0);
+        root.updateMatrixWorld(true);
+        const box1 = new THREE.Box3().setFromObject(root);
+
+        // Step 2: shift root so its bottom sits at Y=0 and it's centered on XZ
+        const cx = (box1.min.x + box1.max.x) / 2;
+        const cz = (box1.min.z + box1.max.z) / 2;
+        root.position.set(-cx, -box1.min.y, -cz);
+        root.updateMatrixWorld(true);
+
+        // Step 3: re-measure to get true world coords
+        const box2 = new THREE.Box3().setFromObject(root);
+        const floorY = box2.min.y;   // should be ~0
+        console.log('Floor Y:', floorY.toFixed(4),
+                    '| Room size:', 
+                    (box2.max.x - box2.min.x).toFixed(2), 'x',
+                    (box2.max.z - box2.min.z).toFixed(2));
+
+        // Snap ground plane exactly to floor
+        if (groundBody) groundBody.position.y = floorY;
+
+        root.traverse((obj) => {
+          if (obj.isMesh) { obj.castShadow = true; obj.receiveShadow = true; }
+          if (obj.name)   console.log('GLB object:', obj.name);
+        });
+
+        // ── Core objects ──────────────────────────────────────────
+        vaultDoor   = root.getObjectByName('vault door');
+        startButton = root.getObjectByName('start');
+        lockboxObj  = root.getObjectByName('lockdoor005');
+        if (lockboxObj) {
+          lockboxObj.userData.type = 'lockbox';
+          console.log('Lockbox found:', lockboxObj.name);
+        } else {
+          console.warn('lockdoor.005 not found in GLB');
+        }
+
+        const gem3Case = root.getObjectByName('gem3_case');
+        if (gem3Case) {
+          scene.attach(gem3Case);
+          gem3CaseObj = gem3Case;  // save ref — hidden when gem2 is removed
+          gem3Case.userData.type = 'case';
+          applyEmissiveToAllMeshes(gem3Case, 0x111111);
+          // gem3case is visible by default, blocking gem3
+        }
+
+        if (startButton) {
+          scene.attach(startButton);
+          buttonGroup.attach(startButton);
+          startButton.userData.type     = 'button';
+          startButton.userData.buttonId = 'start';
+          startButton.userData.baseY    = startButton.position.y;
+          applyEmissiveToAllMeshes(startButton, 0x000000);
+
+          // Measure top-centre of the pedestal in world space
+          startButton.updateWorldMatrix(true, true);
+          const pedBox = new THREE.Box3().setFromObject(startButton);
+          pedestalWorldPos = new THREE.Vector3(
+            -0.5 + (pedBox.min.x + pedBox.max.x) / 2,
+            pedBox.max.y + 0.02,
+            pedBox.min.z + (pedBox.max.z - pedBox.min.z) * (1 / 3)  // right 1/3 = -Z direction
+          );
+          console.log('Pedestal top:', pedestalWorldPos);
+
+          // Green glowing ring — sits flat on top of pedestal
+          const ringGeo  = new THREE.RingGeometry(0.18, 0.26, 40);
+          const ringMat  = new THREE.MeshBasicMaterial({
+            color: 0x00ff88, side: THREE.DoubleSide, transparent: true, opacity: 0.85
+          });
+          pedestalRingMesh = new THREE.Mesh(ringGeo, ringMat);
+          pedestalRingMesh.rotation.x = -Math.PI / 2;
+          pedestalRingMesh.position.copy(pedestalWorldPos);
+          scene.add(pedestalRingMesh);
+        }
+
+        GEM_CONFIG.forEach(({ gemName, slotName, colorName }) => {
+          const gem  = root.getObjectByName(gemName);
+          const slot = root.getObjectByName(slotName);
+
+          if (gem) {
+            scene.attach(gem);
+            grabbableGroup.attach(gem);
+            gem.userData.type      = 'jewel';
+            gem.userData.colorName = colorName;
+            gem.userData.placed    = false;
+            gem.userData.slotName  = slotName;
+            applyEmissiveToAllMeshes(gem, 0x111111);
+            // gem1 hidden until reconstructed
+            if (gemName === 'gem1') gem.visible = false;
+            // gem2 locked until lockbox opened
+            if (gemName === 'gem2') gem.userData.locked = true;
+            // gem3 locked until gem2 is removed (gem3case hides it)
+            if (gemName === 'gem3') gem.userData.locked = true;
+            gems[gemName] = gem;
+
+            // Add physics body to gem2 and gem3
+            if (gemName === 'gem2' || gemName === 'gem3') {
+              gem.updateWorldMatrix(true, true);
+              const gBox = new THREE.Box3().setFromObject(gem);
+              const gCtr = new THREE.Vector3();
+              gBox.getCenter(gCtr);
+              const gemBody = new CANNON.Body({
+                mass: 0.4,
+                linearDamping:  0.3,
+                angularDamping: 0.4,
+                shape: new CANNON.Sphere(0.12),
+              });
+              gemBody.position.set(gCtr.x, gCtr.y, gCtr.z);
+              gemBody.type = CANNON.Body.STATIC; // frozen until unlocked
+              gemBody.allowSleep = true;
+              physicsWorld.addBody(gemBody);
+              gem.userData.physBody = gemBody;
+              physFragments.push({ mesh: gem, body: gemBody });
+              console.log(gemName, 'physics body added');
+            }
+          } else {
+            console.warn('Gem not found:', gemName);
+          }
+
+          if (slot) {
+            scene.attach(slot);
+            slotGroup.attach(slot);
+            slot.userData.type      = 'slot';
+            slot.userData.colorName = colorName;
+            slot.visible = false;   // hidden until gem is placed into it
+            slots[slotName] = slot;
+          } else {
+            console.warn('Slot not found:', slotName);
+          }
+        });
+
+        // ── Gem fragments with physics ─────────────────────────────
+        // Fixed 2-row grid at centre of room, just above the floor.
+        // Positions are explicit so every fragment is guaranteed visible inside the room.
+        const spawnY = floorY + 0.4;
+        // Scattered positions — spread around the room, varied heights, slightly messy
+        const GRID_POSITIONS = [
+          [-1.1, -0.6, 0.55], [ 0.3, -0.9, 0.40], [ 0.9, -0.3, 0.30],
+          [-0.5,  0.7, 0.50], [ 0.6,  1.0, 0.35], [-0.9,  0.1, 0.60],
+          [ 1.2, -0.7, 0.45], [-0.2, -1.1, 0.30], [ 0.4,  0.3, 0.65],
+          [-0.7,  1.2, 0.40],
+        ]; // [x, z, extraY]
+
+        FRAGMENT_NAMES.forEach((name, i) => {
+          const frag = root.getObjectByName(name);
+          if (!frag) { console.warn('Fragment not found:', name); return; }
+
+          scene.attach(frag);
+          fragmentGroup.attach(frag);
+
+          const [gx, gz, ey] = GRID_POSITIONS[i] || [0, 0, 0.4];
+          frag.position.set(gx, spawnY + (ey - 0.4), gz);
+          // Slight random-ish tilt so they don't all look identical
+          frag.rotation.set(
+            (i * 0.37) % (Math.PI * 2),
+            (i * 0.71) % (Math.PI * 2),
+            (i * 0.53) % (Math.PI * 2)
+          );
+
+          frag.userData.type         = 'fragment';
+          frag.userData.isHeld       = false;
+          frag.userData.baseEmissive = 0x110000;
+          applyEmissiveToAllMeshes(frag, 0x110000);
+          frag.castShadow    = true;
+          frag.receiveShadow = true;
+
+          const radius = 0.18;
+
+          const body = new CANNON.Body({
+            mass:           0.15,
+            linearDamping:  0.3,
+            angularDamping: 0.4,
+            shape: new CANNON.Sphere(radius),
+          });
+          body.position.set(gx, spawnY + (ey - 0.4), gz);
+          body.allowSleep = true;
+          physicsWorld.addBody(body);
+
+          physFragments.push({ mesh: frag, body });
+          console.log('Fragment', i, name, 'spawned at', gx, spawnY.toFixed(2), gz);
+        });
+
+        // ── Static collision bodies ────────────────────────────────
+        root.updateWorldMatrix(true, true);
+
+        // Use the measured room AABB (box2) to place 6 inward-facing planes.
+        // CANNON.Plane is infinite and impossible to tunnel through — much more
+        // reliable than thin box colliders derived from mesh AABBs.
+        const roomMin = box2.min;
+        const roomMax = box2.max;
+
+        function addPlane(nx, ny, nz, px, py, pz) {
+          const body = new CANNON.Body({ mass: 0 });
+          body.addShape(new CANNON.Plane());
+          // Orient plane so its normal points inward
+          const normal = new CANNON.Vec3(nx, ny, nz);
+          const up     = new CANNON.Vec3(0, 1, 0);
+          if (Math.abs(ny) > 0.99) {
+            // floor/ceiling — rotate around X
+            body.quaternion.setFromEuler(ny > 0 ? -Math.PI/2 : Math.PI/2, 0, 0);
+          } else {
+            // walls — rotate so plane normal matches desired direction
+            const q = new CANNON.Quaternion();
+            q.setFromVectors(new CANNON.Vec3(0, 0, 1), normal);
+            body.quaternion.copy(q);
+          }
+          body.position.set(px, py, pz);
+          physicsWorld.addBody(body);
+          return body;
+        }
+
+        // Floor — normal points UP (+Y)
+        addPlane(0,  1, 0,  0, roomMin.y, 0);
+        // Ceiling — normal points DOWN (-Y)
+        addPlane(0, -1, 0,  0, roomMax.y, 0);
+        // Left wall  (min X) — normal points +X
+        addPlane( 1, 0, 0,  roomMin.x, 0, 0);
+        // Right wall (max X) — normal points -X
+        addPlane(-1, 0, 0,  roomMax.x, 0, 0);
+        // Front wall (min Z) — normal points +Z
+        addPlane(0, 0,  1,  0, 0, roomMin.z);
+        // Back wall  (max Z) — normal points -Z
+        addPlane(0, 0, -1,  0, 0, roomMax.z);
+
+        console.log('Room planes added. Bounds:',
+          roomMin.x.toFixed(2), roomMax.x.toFixed(2),
+          roomMin.y.toFixed(2), roomMax.y.toFixed(2),
+          roomMin.z.toFixed(2), roomMax.z.toFixed(2));
+
+        // Register small objects as solid box bodies.
+        // 'start' pedestal gets special treatment: one thick box from its full AABB
+        // so fragments never slip through a thin top face.
+        // startButton was already detached from root via scene.attach(), so use the saved ref
+        const startObj = startButton;
+        if (startObj) {
+          startObj.updateWorldMatrix(true, true);
+          const sb   = new THREE.Box3().setFromObject(startObj);
+          const size = new THREE.Vector3();
+          const center = new THREE.Vector3();
+          sb.getSize(size);
+          sb.getCenter(center);
+          // Enforce minimum 0.15 m height so the top face is thick enough to catch fragments
+          const hx = Math.max(size.x / 2, 0.05);
+          const hy = Math.max(size.y / 2, 0.15);
+          const hz = Math.max(size.z / 2, 0.05);
+          const startBody = new CANNON.Body({ mass: 0 });
+          startBody.addShape(new CANNON.Box(new CANNON.Vec3(hx, hy, hz)));
+          startBody.position.set(center.x, center.y, center.z);
+          physicsWorld.addBody(startBody);
+          console.log('start body: size', (hx*2).toFixed(3), (hy*2).toFixed(3), (hz*2).toFixed(3),
+                      'center', center.x.toFixed(3), center.y.toFixed(3), center.z.toFixed(3));
+        }
+
+        const BOX_NAMES = ['1slot', '2slot', '3slot', 'tray', 'vault door', 'gem3_stand'];
+        BOX_NAMES.forEach((name) => {
+          const obj = root.getObjectByName(name);
+          if (!obj) return;
+          const bodies = makeStaticBodies(obj);
+          if (name === 'vault door' && bodies.length > 0) vaultDoorBody = bodies[0];
+        });
+
+// Build debug wireframes after all bodies are registered
+        buildDebugVisuals();
+
+      }, undefined, (err) => console.error('GLB load error:', err));
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Physics debug visualizer
+    // ─────────────────────────────────────────────────────────────
+    const debugMeshes = [];   // { cannonBody, threeMesh }
+    let debugVisible = false;  // set true to see physics wireframes
+
+    function createDebugMeshForBody(body) {
+      const meshes = [];
+      body.shapes.forEach((shape, si) => {
+        let geo, mat;
+        if (shape instanceof CANNON.Sphere) {
+          geo = new THREE.SphereGeometry(shape.radius, 8, 8);
+          mat = new THREE.MeshBasicMaterial({ color: 0x00ff00, wireframe: true });
+        } else if (shape instanceof CANNON.Box) {
+          const he = shape.halfExtents;
+          geo = new THREE.BoxGeometry(he.x * 2, he.y * 2, he.z * 2);
+          mat = new THREE.MeshBasicMaterial({ color: 0xff8800, wireframe: true });
+        } else if (shape instanceof CANNON.Plane) {
+          geo = new THREE.PlaneGeometry(20, 20);
+          mat = new THREE.MeshBasicMaterial({ color: 0x0088ff, wireframe: true, side: THREE.DoubleSide });
+        } else {
+          return;
+        }
+        const m = new THREE.Mesh(geo, mat);
+        const offset = body.shapeOffsets[si];
+        if (offset) m.position.set(offset.x, offset.y, offset.z);
+        scene.add(m);
+        debugMeshes.push({ body, mesh: m, shapeIndex: si });
+        meshes.push(m);
+      });
+      return meshes;
+    }
+
+    function buildDebugVisuals() {
+      // Clear old
+      debugMeshes.forEach(d => scene.remove(d.mesh));
+      debugMeshes.length = 0;
+      physicsWorld.bodies.forEach(body => createDebugMeshForBody(body));
+      console.log('Debug visuals built for', physicsWorld.bodies.length, 'bodies');
+    }
+
+    function updateDebugVisuals() {
+      debugMeshes.forEach(({ body, mesh, shapeIndex }) => {
+        const offset = body.shapeOffsets[shapeIndex];
+        // body position + rotated offset
+        const bq = new THREE.Quaternion(body.quaternion.x, body.quaternion.y, body.quaternion.z, body.quaternion.w);
+        const bp = new THREE.Vector3(body.position.x, body.position.y, body.position.z);
+        if (offset) {
+          const localOffset = new THREE.Vector3(offset.x, offset.y, offset.z).applyQuaternion(bq);
+          mesh.position.copy(bp).add(localOffset);
+        } else {
+          mesh.position.copy(bp);
+        }
+        mesh.quaternion.copy(bq);
+        mesh.visible = debugVisible;
+      });
+    }
+
+    // Press P to toggle debug wireframes
+    window.addEventListener('keydown', (e) => {
+      if (e.key.toLowerCase() === 'p') {
+        debugVisible = !debugVisible;
+        console.log('Physics debug:', debugVisible ? 'ON' : 'OFF');
+      }
+    });
+
+    // ─────────────────────────────────────────────────────────────
+    // Physics step + mesh sync
+    // ─────────────────────────────────────────────────────────────
+    function updatePhysics(dt) {
+      physicsWorld.step(1 / 60, Math.min(dt, 0.05), 3);
+
+      for (const { mesh, body } of physFragments) {
+        if (mesh.userData.isHeld) continue;           // fragment held by hand
+        if (body.type === CANNON.Body.STATIC && mesh.userData.type === 'jewel') continue; // gem held
+        mesh.position.set(body.position.x, body.position.y, body.position.z);
+        mesh.quaternion.set(body.quaternion.x, body.quaternion.y,
+                            body.quaternion.z, body.quaternion.w);
+      }
+
+      updateDebugVisuals();
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Controller velocity tracking (for realistic throws)
+    // ─────────────────────────────────────────────────────────────
+    function trackControllerVelocities(dt) {
+      [controller1, controller2].forEach((ctrl, i) => {
+        ctrlPrevPos[i].copy(ctrlCurrPos[i]);
+        ctrl.getWorldPosition(ctrlCurrPos[i]);
+        if (dt > 0) ctrlVel[i].subVectors(ctrlCurrPos[i], ctrlPrevPos[i]).divideScalar(dt);
+      });
+    }
+
+    // While a fragment is held, push its cannon body to match the Three mesh
+    function syncHeldFragments() {
+      [controller1, controller2].forEach((ctrl) => {
+        const frag = ctrl.userData.selectedFragment;
+        if (!frag) return;
+        const entry = frag.userData.physEntry;
+        if (!entry) return;
+        const wp = new THREE.Vector3();
+        const wq = new THREE.Quaternion();
+        frag.getWorldPosition(wp);
+        frag.getWorldQuaternion(wq);
+        entry.body.position.set(wp.x, wp.y, wp.z);
+        entry.body.quaternion.set(wq.x, wq.y, wq.z, wq.w);
+      });
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Fragment grab / release
+    // ─────────────────────────────────────────────────────────────
+    function tryGrabFragment(controller) {
+      raycaster.setFromXRController(controller);
+      const hits = raycaster.intersectObjects(fragmentGroup.children, true);
+      if (hits.length === 0) return false;
+
+      const root = findTaggedRoot(hits[0].object);
+      if (!root || root.userData.type !== 'fragment' || root.userData.isHeld) return false;
+
+      const entry = physFragments.find(p => p.mesh === root);
+      if (!entry) return false;
+
+      // Freeze physics while held
+      entry.body.type = CANNON.Body.STATIC;
+      entry.body.velocity.setZero();
+      entry.body.angularVelocity.setZero();
+
+      root.userData.isHeld    = true;
+      root.userData.physEntry = entry;
+
+      setRootEmissive(root, 0x440000);
+      controller.attach(root);
+      controller.userData.selectedFragment = root;
+      return true;
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Fragment deposit + reconstruction
+    // ─────────────────────────────────────────────────────────────
+    function tryDepositFragment(fragMesh, entry) {
+      if (reconstructionDone || !pedestalWorldPos) return false;
+
+      const wp = new THREE.Vector3();
+      fragMesh.getWorldPosition(wp);
+      if (wp.distanceTo(pedestalWorldPos) > PEDESTAL_SNAP_RADIUS) return false;
+
+      // Snap fragment onto the pedestal in a small spiral arrangement
+      const angle  = (deposited / TOTAL_FRAGMENTS) * Math.PI * 2;
+      const radius = 0.08 + (deposited % 3) * 0.06;
+      const snapX  = pedestalWorldPos.x + Math.cos(angle) * radius;
+      const snapZ  = pedestalWorldPos.z + Math.sin(angle) * radius;
+      const snapY  = pedestalWorldPos.y + deposited * 0.012; // slight stack
+
+      // Freeze physics body at snap position
+      entry.body.type = CANNON.Body.STATIC;
+      entry.body.velocity.setZero();
+      entry.body.angularVelocity.setZero();
+      entry.body.position.set(snapX, snapY, snapZ);
+      entry.body.quaternion.set(0, 0, 0, 1);
+
+      fragMesh.position.set(snapX, snapY, snapZ);
+      fragMesh.rotation.set(0, 0, 0);
+      fragMesh.userData.isHeld    = false;
+      fragMesh.userData.physEntry = null;
+      fragMesh.userData.deposited = true;
+      setRootEmissive(fragMesh, 0x003300);
+      fragmentGroup.attach(fragMesh);
+
+      deposited++;
+      console.log(`Fragment deposited: ${deposited}/${TOTAL_FRAGMENTS}`);
+
+      if (deposited >= TOTAL_FRAGMENTS) {
+        setTimeout(reconstructGem1, 600); // brief pause before flash
+      }
+      return true;
+    }
+
+    function reconstructGem1() {
+      if (reconstructionDone) return;
+      reconstructionDone = true;
+
+      // Hide all fragments + freeze their bodies (skip any non-fragment entries)
+      physFragments.forEach(({ mesh, body }) => {
+        if (mesh.userData.type !== 'fragment') return;
+        mesh.visible = false;
+        body.type = CANNON.Body.STATIC;
+        body.sleep();
+      });
+
+      // Hide the ring
+      if (pedestalRingMesh) pedestalRingMesh.visible = false;
+
+      const gem1 = gems['gem1'];
+      if (!gem1) { console.warn('gem1 not found'); return; }
+
+      // ── Find tray top-centre ──
+      // tray was kept in root (not detached), so search worldRoot
+      let spawnPos = new THREE.Vector3(0, 1.2, 0); // safe fallback
+      let trayObj = null;
+      worldRoot.traverse(o => { if (o.name === 'tray') trayObj = o; });
+      if (trayObj) {
+        trayObj.updateWorldMatrix(true, true);
+        const tb = new THREE.Box3().setFromObject(trayObj);
+        spawnPos.set(
+          (tb.min.x + tb.max.x) / 2,
+          tb.max.y + 0.25,          // spawn above tray so it drops onto it
+          (tb.min.z + tb.max.z) / 2
+        );
+      }
+      console.log('gem1 spawn pos:', spawnPos);
+
+      // ── Show gem1 at spawn position ──
+      gem1.visible = true;
+      scene.attach(gem1);
+      gem1.position.copy(spawnPos);
+      gem1.updateMatrixWorld(true);
+      gem1.userData.placed   = false;
+      gem1.userData.physBody = null;
+      // Mark gem1's puzzle as solved so it can be placed into its slot immediately
+      gameState.puzzleSolved['gem1'] = true;
+      console.log('gem1 visible:', gem1.visible, 'position:', gem1.position);
+
+      // ── Create a dynamic physics body for gem1 ──
+      // Use a fixed radius since the gem might have no geometry until rendered
+      const gr = 0.15;
+
+      const gemBody = new CANNON.Body({
+        mass:           0.5,
+        linearDamping:  0.3,
+        angularDamping: 0.4,
+        shape: new CANNON.Sphere(gr),
+      });
+      gemBody.position.set(spawnPos.x, spawnPos.y, spawnPos.z);
+      gemBody.allowSleep = true;
+      physicsWorld.addBody(gemBody);
+      gem1.userData.physBody = gemBody;
+
+      // Track it so updatePhysics syncs it each frame
+      physFragments.push({ mesh: gem1, body: gemBody });
+
+      // Add to grabbableGroup so raycaster can find it
+      grabbableGroup.attach(gem1);
+
+      // ── Pulse animation ──
+      let pulses = 0;
+      const pulseInterval = setInterval(() => {
+        const bright = (pulses % 2 === 0);
+        applyEmissiveToAllMeshes(gem1, bright ? 0x88ffcc : 0x111111);
+        pulses++;
+        if (pulses >= 8) {
+          clearInterval(pulseInterval);
+          applyEmissiveToAllMeshes(gem1, 0x111111);
+        }
+      }, 150);
+
+      console.log('gem1 reconstructed with physics, radius:', gr.toFixed(3));
+    }
+
+    function releaseFragment(controller) {
+      const root = controller.userData.selectedFragment;
+      if (!root) return;
+
+      const entry = root.userData.physEntry;
+
+      // Check deposit FIRST — if it lands on the pedestal, freeze it there
+      if (entry && tryDepositFragment(root, entry)) {
+        controller.userData.selectedFragment = undefined;
+        return;
+      }
+
+      if (entry) {
+        // Re-enable physics
+        entry.body.type = CANNON.Body.DYNAMIC;
+        entry.body.wakeUp();
+
+        // Sync final world pose to cannon before releasing
+        const wp = new THREE.Vector3();
+        const wq = new THREE.Quaternion();
+        root.getWorldPosition(wp);
+        root.getWorldQuaternion(wq);
+        entry.body.position.set(wp.x, wp.y, wp.z);
+        entry.body.quaternion.set(wq.x, wq.y, wq.z, wq.w);
+
+        // Throw velocity = controller hand velocity × scale
+        const ci  = controller === controller1 ? 0 : 1;
+        const vel = ctrlVel[ci];
+        const THROW_SCALE = 2.5;
+        entry.body.velocity.set(
+          vel.x * THROW_SCALE,
+          vel.y * THROW_SCALE,
+          vel.z * THROW_SCALE
+        );
+      }
+
+      root.userData.isHeld    = false;
+      root.userData.physEntry = null;
+      setRootEmissive(root, root.userData.baseEmissive ?? 0x110000);
+
+      fragmentGroup.attach(root);
+      controller.userData.selectedFragment = undefined;
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Hover highlight for fragments
+    // ─────────────────────────────────────────────────────────────
+    function intersectFragments(controller) {
+      if (controller.userData.selectedFragment !== undefined) return;
+
+      const line = controller.getObjectByName('line');
+      raycaster.setFromXRController(controller);
+      const hits = raycaster.intersectObjects(fragmentGroup.children, true);
+
+      if (hits.length > 0) {
+        const root = findTaggedRoot(hits[0].object);
+        if (root && root.userData.type === 'fragment' && !root.userData.isHeld) {
+          setRootEmissive(root, 0x550000);
+          intersected.push(root);
+        }
+        if (line) line.scale.z = hits[0].distance;
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Controller events — fragment grab takes priority
+    // ─────────────────────────────────────────────────────────────
+    function onSelectStart(event) {
+      const controller = event.target;
+
+      // 0. Check pad buttons or lockbox (VR)
+      raycaster.setFromXRController(controller);
+      if (lockboxUIVisible && tryHitPadButton(raycaster)) return;
+      if (lockboxObj && !lockboxOpen && !lockboxUIVisible) {
+        const lbHits = raycaster.intersectObjects([lockboxObj], true);
+        if (lbHits.length > 0) { showLockboxUI(); return; }
+      }
+
+      // 1. Try fragment first
+      if (tryGrabFragment(controller)) return;
+
+      // 2. Existing jewel / case / key logic
+      const hits = getIntersections(controller, grabbableGroup.children);
+      if (hits.length === 0) return;
+      const root = findTaggedRoot(hits[0].object);
+      if (!root) return;
+      const isGrabbable = root.userData.type === 'jewel' || root.userData.type === 'case';
+      if (!isGrabbable || root.userData.placed || root.userData.locked) return;
+      setRootEmissive(root, root.userData.type === 'case' ? 0x004444 : 0x0000aa);
+
+      // Freeze physics body while held
+      if (root.userData.physBody) {
+        root.userData.physBody.type = CANNON.Body.STATIC;
+        root.userData.physBody.velocity.setZero();
+        root.userData.physBody.angularVelocity.setZero();
+      }
+
+
+      controller.attach(root);
+      controller.userData.selected = root;
+
+    }
+
+    function onSelectEnd(event) {
+      const controller = event.target;
+
+      // Fragment release
+      if (controller.userData.selectedFragment !== undefined) {
+        releaseFragment(controller);
+        return;
+      }
+
+      // Jewel / case release
+      const root = controller.userData.selected;
+      if (!root) return;
+
+      if (root.userData.type === 'case') {
+        caseGroup.attach(root);
+        setRootEmissive(root, 0x000000);
+        const gemName = root.userData.unlocksGem;
+        if (gemName && gems[gemName]) {
+          gems[gemName].userData.locked = false;
+          applyEmissiveToAllMeshes(gems[gemName], 0x111111);
+        }
+        controller.userData.selected = undefined;
+        return;
+      }
+
+      grabbableGroup.attach(root);
+      setRootEmissive(root, root.userData.baseEmissive ?? 0x111111);
+
+      // If this jewel has a physics body (gem1 after reconstruction), re-enable it
+      if (root.userData.physBody) {
+        const pb = root.userData.physBody;
+        pb.type = CANNON.Body.DYNAMIC;
+        pb.wakeUp();
+        // Sync world pos → body
+        const wp2 = new THREE.Vector3();
+        const wq2 = new THREE.Quaternion();
+        root.getWorldPosition(wp2);
+        root.getWorldQuaternion(wq2);
+        pb.position.set(wp2.x, wp2.y, wp2.z);
+        pb.quaternion.set(wq2.x, wq2.y, wq2.z, wq2.w);
+        // Throw velocity from controller
+        const ci2  = controller === controller1 ? 0 : 1;
+        const vel2 = ctrlVel[ci2];
+        pb.velocity.set(vel2.x * 2.5, vel2.y * 2.5, vel2.z * 2.5);
+      }
+
+      if (root.userData.type === 'jewel' && !root.userData.placed) tryPlaceJewel(root);
+
+      controller.userData.selected = undefined;
+    }
+
+    function onSqueezeStart(event) {
+      const controller = event.target;
+      const hits = getIntersections(controller, buttonGroup.children);
+      if (hits.length > 0) {
+        const root = findTaggedRoot(hits[0].object);
+        if (root?.userData.type === 'button') pressStartButton(root);
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Game logic (unchanged)
+    // ─────────────────────────────────────────────────────────────
+    function pressStartButton(button) {
+      if (GEM_CONFIG.every(({ colorName }) => gameState.puzzleSolved[colorName])) return;
+      button.position.y = button.userData.baseY - 0.03;
+      setRootEmissive(button, 0x333300);
+      GEM_CONFIG.forEach(({ colorName }) => { gameState.puzzleSolved[colorName] = true; });
+      console.log('Start button pressed: all gems activated.');
+    }
+
+    function tryPlaceJewel(jewel) {
+      const slot = slots[jewel.userData.slotName];
+      if (!slot) return;
+
+      const jp = new THREE.Vector3();
+      const sp = new THREE.Vector3();
+      jewel.getWorldPosition(jp);
+      slot.getWorldPosition(sp);
+
+      // Generous snap radius — just needs to be close to the right pedestal slot
+      if (jp.distanceTo(sp) > 0.8) return;
+
+      // Snap gem to the exact slot world position
+      jewel.userData.placed = true;
+      jewel.position.copy(sp);
+      slotGroup.attach(jewel);
+      setRootEmissive(jewel, 0x222200);
+
+      // Reveal the slot indicator now that it's filled
+      slot.visible = true;
+      // Hide the gem mesh itself — the slot object IS the visual now
+      jewel.visible = false;
+
+      // Freeze physics body if gem has one (gem1 after reconstruction)
+      if (jewel.userData.physBody) {
+        jewel.userData.physBody.type = CANNON.Body.STATIC;
+        jewel.userData.physBody.velocity.setZero();
+        jewel.userData.physBody.angularVelocity.setZero();
+        const fp = new THREE.Vector3();
+        jewel.getWorldPosition(fp);
+        jewel.userData.physBody.position.set(fp.x, fp.y, fp.z);
+      }
+
+      gameState.jewelsPlaced[jewel.userData.colorName] = true;
+      console.log('✓', jewel.userData.colorName, 'placed — slot revealed');
+      checkDoorUnlock();
+    }
+
+    function checkDoorUnlock() {
+      // If gem1 AND gem2 are both placed, reveal gem3
+      if (gameState.jewelsPlaced['gem1'] && gameState.jewelsPlaced['gem2']) {
+        unlockGem3();
+      }
+
+      if (GEM_CONFIG.every(({ colorName }) => gameState.jewelsPlaced[colorName]) && !gameState.doorUnlocked) {
+        gameState.doorUnlocked = true;
+        console.log('Vault unlocked!');
+      }
+    }
+
+    function unlockGem3() {
+      if (!gem3CaseObj || !gem3CaseObj.visible) return; // already done
+      gem3CaseObj.visible = false;
+      const gem3 = gems['gem3'];
+      if (gem3) {
+        gem3.userData.locked = false;
+        if (gem3.userData.physBody) {
+          gem3.userData.physBody.type = CANNON.Body.DYNAMIC;
+          gem3.userData.physBody.wakeUp();
+        }
+        applyEmissiveToAllMeshes(gem3, 0x111111);
+        console.log('gem3 unlocked — gem1 + gem2 both placed');
+      }
+    }
+
+    function updateVaultDoor(dt) {
+      if (!vaultDoor || !gameState.doorUnlocked) return;
+      vaultDoor.position.y = Math.min(vaultDoor.position.y + dt * 1.0, 4.5);
+
+      // Keep the static physics body in sync with the rising door mesh
+      if (vaultDoorBody) {
+        const wp = new THREE.Vector3();
+        vaultDoor.getWorldPosition(wp);
+        // Re-derive the AABB center offset from the door's current world position
+        vaultDoor.updateWorldMatrix(true, true);
+        const box    = new THREE.Box3().setFromObject(vaultDoor);
+        const center = new THREE.Vector3();
+        box.getCenter(center);
+        vaultDoorBody.position.set(center.x, center.y, center.z);
+        vaultDoorBody.wakeUp();
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Locomotion (unchanged)
+    // ─────────────────────────────────────────────────────────────
+    function setupKeyboard() {
+      window.addEventListener('keydown', (e) => { const k = e.key.toLowerCase(); if (k in keys) keys[k] = true;  });
+      window.addEventListener('keyup',   (e) => { const k = e.key.toLowerCase(); if (k in keys) keys[k] = false; });
+    }
+
+    function updateLocomotion(dt) {
+      // ── Desktop: WASD moves playerRig directly ──
+      if (!renderer.xr.isPresenting) {
+        let dx = 0, dz = 0;
+        if (keys.a) dx -= 1;
+        if (keys.d) dx += 1;
+        if (keys.w) dz -= 1;
+        if (keys.s) dz += 1;
+        if (dx === 0 && dz === 0) return;
+
+        const len = Math.sqrt(dx * dx + dz * dz);
+        dx /= len; dz /= len;
+
+        const forward = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw)).negate();
+        const right   = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+
+        playerRig.position.addScaledVector(forward, dz * MOVE_SPEED * dt);
+        playerRig.position.addScaledVector(right,   dx * MOVE_SPEED * dt);
+        return;
+      }
+
+      // ── VR: left stick moves playerRig directly (same pattern as WASD) ──
+      let axisX = 0, axisZ = 0;
+      const session = renderer.xr.getSession();
+      if (session) {
+        for (const src of session.inputSources) {
+          if (src.handedness === 'left' && src.gamepad) {
+            axisX = Math.abs(src.gamepad.axes[2]) > 0.12 ? src.gamepad.axes[2] : 0;
+            axisZ = Math.abs(src.gamepad.axes[3]) > 0.12 ? src.gamepad.axes[3] : 0;
+          }
+        }
+      }
+      if (axisX === 0 && axisZ === 0) return;
+
+      // Use the headset's look direction (camera in XR = HMD pose)
+      const forward = new THREE.Vector3();
+      camera.getWorldDirection(forward);
+      forward.y = 0; forward.normalize();
+      const right = new THREE.Vector3()
+        .crossVectors(forward, new THREE.Vector3(0, 1, 0)).normalize();
+
+      playerRig.position.addScaledVector(forward, -axisZ * MOVE_SPEED * dt);
+      playerRig.position.addScaledVector(right,    axisX * MOVE_SPEED * dt);
+    }
+
+    function syncPlayerRig() { /* no-op: rig driven directly */ }
+
+    // ─────────────────────────────────────────────────────────────
+    // Scene setup helpers
+    // ─────────────────────────────────────────────────────────────
+    function setupLighting() {
+      scene.add(new THREE.HemisphereLight(0xcad8ff, 0x303030, 2.2));
+      const dir = new THREE.DirectionalLight(0xffffff, 2.0);
+      dir.position.set(3, 6, 4);
+      dir.castShadow = true;
+      dir.shadow.mapSize.set(1024, 1024);
+      scene.add(dir);
+      scene.add(new THREE.GridHelper(10, 10));
+      const ring = new THREE.Mesh(
+        new THREE.RingGeometry(0.25, 0.32, 32),
+        new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.DoubleSide })
+      );
+      ring.rotation.x = -Math.PI / 2;
+      ring.position.set(0, 0.01, 0);
+      scene.add(ring);
+    }
+
+    function setupGroups() {
+      worldRoot      = new THREE.Group();
+      grabbableGroup = new THREE.Group();
+      buttonGroup    = new THREE.Group();
+      slotGroup      = new THREE.Group();
+      caseGroup      = new THREE.Group();
+      fragmentGroup  = new THREE.Group();   // ← new
+      scene.add(worldRoot, grabbableGroup, buttonGroup, slotGroup, caseGroup, fragmentGroup);
+    }
+
+    function setupRenderer() {
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled    = true;
+      renderer.shadowMap.enabled = true;
+      renderer.setAnimationLoop(animate);
+      document.body.appendChild(renderer.domElement);
+      document.body.appendChild(VRButton.createButton(renderer));
+
+      // Crosshair dot for desktop aiming
+      const xhair = document.createElement('div');
+      xhair.style.cssText = `
+        position:fixed; top:50%; left:50%; width:6px; height:6px;
+        margin:-3px 0 0 -3px; border-radius:50%;
+        background:rgba(255,255,255,0.8); pointer-events:none; z-index:50;
+      `;
+      document.body.appendChild(xhair);
+
+      setupMouseLook();
+    }
+
+    // Simple pointer-lock mouse look — click canvas to capture, Esc to release
+    let yaw = 0, pitch = 0;
+    let desktopAimingAtLockbox = false;
+
+    function setupMouseLook() {
+      const canvas = renderer.domElement;
+
+      // mousedown fires reliably even under pointer lock (unlike click)
+      canvas.addEventListener('mousedown', (e) => {
+        if (e.button !== 0) return; // left button only
+
+        if (document.pointerLockElement !== canvas) {
+          // Not locked yet — request lock on click
+          canvas.requestPointerLock();
+          return;
+        }
+
+        // Pointer locked — check pad buttons first, then lockbox
+        raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+        if (lockboxUIVisible && tryHitPadButton(raycaster)) return;
+        if (lockboxObj && !lockboxOpen && !lockboxUIVisible) {
+          const hits = raycaster.intersectObjects([lockboxObj], true);
+          if (hits.length > 0) { showLockboxUI(); return; }
+        }
+      });
+
+      document.addEventListener('pointerlockchange', () => {
+        desktopAimingAtLockbox = false;
+      });
+
+      document.addEventListener('mousemove', (e) => {
+        if (document.pointerLockElement !== canvas) return;
+        yaw   -= e.movementX * 0.002;
+        pitch -= e.movementY * 0.002;
+        pitch  = Math.max(-Math.PI / 2.5, Math.min(Math.PI / 2.5, pitch));
+        camera.rotation.order = 'YXZ';
+        camera.rotation.y = yaw;
+        camera.rotation.x = pitch;
+      });
+    }
+
+    function setupControllers() {
+      controller1 = renderer.xr.getController(0);
+      controller1.addEventListener('selectstart',  onSelectStart);
+      controller1.addEventListener('selectend',    onSelectEnd);
+      controller1.addEventListener('squeezestart', onSqueezeStart);
+      playerRig.add(controller1);
+
+      controller2 = renderer.xr.getController(1);
+      controller2.addEventListener('selectstart',  onSelectStart);
+      controller2.addEventListener('selectend',    onSelectEnd);
+      controller2.addEventListener('squeezestart', onSqueezeStart);
+      playerRig.add(controller2);
+
+      const factory = new XRControllerModelFactory();
+      controllerGrip1 = renderer.xr.getControllerGrip(0);
+      controllerGrip1.add(factory.createControllerModel(controllerGrip1));
+      playerRig.add(controllerGrip1);
+      controllerGrip2 = renderer.xr.getControllerGrip(1);
+      controllerGrip2.add(factory.createControllerModel(controllerGrip2));
+      playerRig.add(controllerGrip2);
+
+      const lineGeo = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1)
+      ]);
+      const line = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: 0xffffff }));
+      line.name = 'line'; line.scale.z = 5;
+      controller1.add(line.clone());
+      controller2.add(line.clone());
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Shared helpers
+    // ─────────────────────────────────────────────────────────────
+    function applyEmissiveToAllMeshes(root, hex) {
+      root.traverse((obj) => {
+        if (obj.isMesh && obj.material && 'emissive' in obj.material) {
+          obj.material.emissive.setHex(hex);
+          obj.userData.baseEmissive = hex;
+        }
+      });
+    }
+
+    function setRootEmissive(root, hex) {
+      root.traverse((obj) => {
+        if (obj.isMesh && obj.material && 'emissive' in obj.material)
+          obj.material.emissive.setHex(hex);
+      });
+    }
+
+    function findTaggedRoot(object) {
+      let cur = object;
+      while (cur) { if (cur.userData?.type) return cur; cur = cur.parent; }
+      return null;
+    }
+
+    function getIntersections(controller, objects) {
+      raycaster.setFromXRController(controller);
+      return raycaster.intersectObjects(objects, true);
+    }
+
+    function cleanIntersected() {
+      while (intersected.length) {
+        const root = intersected.pop();
+        if (!root) continue;
+        if (root.userData.type === 'fragment' && !root.userData.isHeld) {
+          setRootEmissive(root, root.userData.baseEmissive ?? 0x110000);
+        } else if ((root.userData.type === 'jewel' && !root.userData.placed) ||
+                    root.userData.type === 'case') {
+          setRootEmissive(root, root.userData.baseEmissive ?? 0x111111);
+        } else if (root.userData.type === 'button') {
+          setRootEmissive(root, 0x000000);
+        } else if (root.userData.type === 'lockbox') {
+          setRootEmissive(root, 0x000000);
+        }
+      }
+    }
+
+    function intersectObjects(controller) {
+      if (controller.userData.selected !== undefined) return;
+      const line = controller.getObjectByName('line');
+      const candidates = [
+        ...grabbableGroup.children,
+        ...buttonGroup.children,
+        ...caseGroup.children
+      ];
+      const hits = getIntersections(controller, candidates);
+      if (hits.length > 0) {
+        const root = findTaggedRoot(hits[0].object);
+        if (root) {
+          if (root.userData.type === 'jewel' && !root.userData.placed && !root.userData.locked) {
+            setRootEmissive(root, 0x330000); intersected.push(root);
+          } else if (root.userData.type === 'case') {
+            setRootEmissive(root, 0x003333); intersected.push(root);
+          } else if (root.userData.type === 'button') {
+            setRootEmissive(root, 0x222200); intersected.push(root);
+          } else if (root.userData.type === 'lockbox') {
+            setRootEmissive(root, 0x002200); intersected.push(root);
+          }
+        }
+        if (line) line.scale.z = hits[0].distance;
+      } else {
+        if (line) line.scale.z = 5;
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 3D In-world keypad — works in both desktop and VR
+    // ─────────────────────────────────────────────────────────────
+    let padGroup      = null;   // root group for the whole keypad
+    let padButtons    = [];     // { mesh, label } — raycaster targets
+    let padDisplayCtx = null;   // canvas 2d context for the display
+    let padDisplayTex = null;   // texture updated each keypress
+    let padMsgTimer   = 0;      // how long to show error message
+
+    const PAD_KEYS = [1,2,3,4,5,6,7,8,9,'⌫',0,'✓'];
+
+    function showLockboxUI() {
+      if (lockboxUIVisible || padGroup) return;
+      lockboxUIVisible = true;
+      lockboxInput = '';
+
+      // Position the pad in front of the lockbox, facing the player
+      const lbPos = new THREE.Vector3();
+      lockboxObj.getWorldPosition(lbPos);
+
+      padGroup = new THREE.Group();
+      scene.add(padGroup);
+
+      // Face the pad toward the camera
+      const camPos = new THREE.Vector3();
+      camera.getWorldPosition(camPos);
+      const dir = new THREE.Vector3().subVectors(camPos, lbPos).setY(0).normalize();
+      padGroup.position.copy(lbPos).addScaledVector(dir, 0.4);
+      padGroup.position.y = lbPos.y + 0.1;
+      padGroup.lookAt(camPos.x, padGroup.position.y, camPos.z);
+
+      // ── Background panel ──
+      const bgGeo = new THREE.BoxGeometry(0.52, 0.62, 0.025);
+      const bgMat = new THREE.MeshStandardMaterial({ color: 0x0d0d1a, roughness: 0.8 });
+      const bg    = new THREE.Mesh(bgGeo, bgMat);
+      padGroup.add(bg);
+
+      // Green border frame
+      const frameGeo = new THREE.BoxGeometry(0.54, 0.64, 0.015);
+      const frameMat = new THREE.MeshBasicMaterial({ color: 0x00ff88 });
+      const frame    = new THREE.Mesh(frameGeo, frameMat);
+      frame.position.z = -0.006;
+      padGroup.add(frame);
+
+      // ── Display canvas texture ──
+      const dispCanvas = document.createElement('canvas');
+      dispCanvas.width  = 256;
+      dispCanvas.height = 64;
+      padDisplayCtx = dispCanvas.getContext('2d');
+      padDisplayTex = new THREE.CanvasTexture(dispCanvas);
+      const dispGeo = new THREE.PlaneGeometry(0.44, 0.09);
+      const dispMat = new THREE.MeshBasicMaterial({ map: padDisplayTex });
+      const dispMesh= new THREE.Mesh(dispGeo, dispMat);
+      dispMesh.position.set(0, 0.23, 0.014);
+      padGroup.add(dispMesh);
+      updatePadDisplay();
+
+      // ── Buttons: 3×4 grid ──
+      const btnW = 0.13, btnH = 0.1, btnGap = 0.015;
+      const startX = -btnW - btnGap;
+      const startY = 0.1;
+
+      PAD_KEYS.forEach((label, i) => {
+        const col = i % 3;
+        const row = Math.floor(i / 3);
+        const bx  = startX + col * (btnW + btnGap);
+        const by  = startY - row * (btnH + btnGap);
+
+        const isAction = label === '⌫' || label === '✓';
+        const btnColor = label === '✓' ? 0x004422 : isAction ? 0x220022 : 0x111133;
+
+        const bGeo = new THREE.BoxGeometry(btnW, btnH, 0.025);
+        const bMat = new THREE.MeshStandardMaterial({
+          color: btnColor, roughness: 0.5,
+          emissive: new THREE.Color(0x001100)
+        });
+        const btn = new THREE.Mesh(bGeo, bMat);
+        btn.position.set(bx, by, 0.018);
+        btn.userData.padKey = String(label);
+        btn.userData.type   = 'padbutton';
+        btn.userData.baseMat = bMat;
+        padGroup.add(btn);
+        padButtons.push(btn);
+
+        // Label canvas
+        const lc  = document.createElement('canvas');
+        lc.width  = 64; lc.height = 48;
+        const lx  = lc.getContext('2d');
+        lx.fillStyle = '#00ff88';
+        lx.font      = 'bold 28px monospace';
+        lx.textAlign = 'center';
+        lx.textBaseline = 'middle';
+        lx.fillText(String(label), 32, 24);
+        const lt  = new THREE.CanvasTexture(lc);
+        const lGeo= new THREE.PlaneGeometry(btnW * 0.75, btnH * 0.75);
+        const lMat= new THREE.MeshBasicMaterial({ map: lt, transparent: true });
+        const lm  = new THREE.Mesh(lGeo, lMat);
+        lm.position.set(bx, by, 0.033);
+        padGroup.add(lm);
+      });
+
+      // ── Close (×) button top-right ──
+      const closeGeo = new THREE.BoxGeometry(0.07, 0.05, 0.025);
+      const closeMat = new THREE.MeshStandardMaterial({ color: 0x440000, emissive: new THREE.Color(0x110000) });
+      const closeBtn = new THREE.Mesh(closeGeo, closeMat);
+      closeBtn.position.set(0.22, 0.285, 0.018);
+      closeBtn.userData.padKey = 'CLOSE';
+      closeBtn.userData.type   = 'padbutton';
+      padGroup.add(closeBtn);
+      padButtons.push(closeBtn);
+
+      const closeLC  = document.createElement('canvas');
+      closeLC.width  = 48; closeLC.height = 32;
+      const cLx = closeLC.getContext('2d');
+      cLx.fillStyle = '#ff4444'; cLx.font = 'bold 22px monospace';
+      cLx.textAlign = 'center'; cLx.textBaseline = 'middle';
+      cLx.fillText('✕', 24, 16);
+      const closeLT  = new THREE.CanvasTexture(closeLC);
+      const closeLM  = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.055, 0.04),
+        new THREE.MeshBasicMaterial({ map: closeLT, transparent: true })
+      );
+      closeLM.position.set(0.22, 0.285, 0.033);
+      padGroup.add(closeLM);
+    }
+
+    function updatePadDisplay(msg) {
+      if (!padDisplayCtx) return;
+      const c = padDisplayCtx;
+      c.fillStyle = '#0d0d1a';
+      c.fillRect(0, 0, 256, 64);
+      if (msg) {
+        c.fillStyle = '#ff4444';
+        c.font = 'bold 18px monospace';
+        c.textAlign = 'center';
+        c.textBaseline = 'middle';
+        c.fillText(msg, 128, 32);
+      } else {
+        const shown = lockboxInput.padEnd(4, '_').split('').join('  ');
+        c.fillStyle = '#ffffff';
+        c.font = 'bold 32px monospace';
+        c.textAlign = 'center';
+        c.textBaseline = 'middle';
+        c.fillText(shown, 128, 34);
+      }
+      if (padDisplayTex) padDisplayTex.needsUpdate = true;
+    }
+
+    function handlePadKey(label) {
+      if (label === 'CLOSE') { closeLockboxUI(); return; }
+      if (label === '⌫') {
+        lockboxInput = lockboxInput.slice(0, -1);
+        updatePadDisplay(); return;
+      }
+      if (label === '✓') {
+        if (lockboxInput.length < 4) { showPadMsg('Enter 4 digits'); return; }
+        if (lockboxInput === LOCKBOX_CODE) { closeLockboxUI(); openLockbox(); }
+        else { lockboxInput = ''; showPadMsg('Wrong code'); }
+        return;
+      }
+      if (lockboxInput.length >= 4) return;
+      lockboxInput += label;
+      updatePadDisplay();
+    }
+
+    function showPadMsg(msg) {
+      updatePadDisplay(msg);
+      padMsgTimer = 1.5; // seconds to show message
+    }
+
+    function closeLockboxUI() {
+      if (padGroup) { scene.remove(padGroup); padGroup = null; }
+      padButtons = [];
+      padDisplayCtx = null;
+      padDisplayTex = null;
+      lockboxUIVisible = false;
+      lockboxInput = '';
+    }
+
+    // Raycast against pad buttons — called from both desktop mousedown and VR selectstart
+    function tryHitPadButton(raycasterRef) {
+      if (!padGroup || !lockboxUIVisible) return false;
+      const hits = raycasterRef.intersectObjects(padButtons, false);
+      if (hits.length === 0) return false;
+      const btn = hits[0].object;
+      // Flash button
+      btn.material.emissive.setHex(0x00ff44);
+      setTimeout(() => btn.material.emissive.setHex(0x001100), 120);
+      handlePadKey(btn.userData.padKey);
+      return true;
+    }
+
+    // ── Wire up desktop mousedown to pad buttons ──
+    // (called from setupMouseLook context — we patch it via animate loop instead)
+
+    // ── Legacy stubs so nothing breaks ──
+    window.lbKey   = function() {};
+    window.lbClose = function() { closeLockboxUI(); };
+
+    function openLockbox() {
+      if (lockboxOpen) return;
+      lockboxOpen = true;
+
+      // Swing door open on Y axis
+      if (lockboxObj) {
+        const startRot  = lockboxObj.rotation.y;
+        const targetRot = startRot - Math.PI / 2;
+        let t = 0;
+        const swing = setInterval(() => {
+          t += 0.04;
+          lockboxObj.rotation.y = THREE.MathUtils.lerp(startRot, targetRot, Math.min(t, 1));
+          if (t >= 1) {
+            clearInterval(swing);
+            const gem2 = gems['gem2'];
+            if (gem2) {
+              gem2.userData.locked = false;
+              applyEmissiveToAllMeshes(gem2, 0x111111);
+              console.log('gem2 unlocked');
+            }
+          }
+        }, 16);
+      }
+      console.log('Lockbox opened!');
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Render loop
+    // ─────────────────────────────────────────────────────────────
+    function animate() {
+      const dt = clock.getDelta();
+
+      trackControllerVelocities(dt);   // must come first
+      syncHeldFragments();              // keep cannon bodies aligned while held
+      updateLocomotion(dt);            // set velocity on player body
+      updatePhysics(dt);               // step sim + sync meshes
+      syncPlayerRig();                 // copy player body position → rig
+
+      cleanIntersected();
+      intersectObjects(controller1);
+      intersectObjects(controller2);
+      intersectFragments(controller1); // fragment hover highlight
+      intersectFragments(controller2);
+      updateVaultDoor(dt);
+      if (padMsgTimer > 0) {
+        padMsgTimer -= dt;
+        if (padMsgTimer <= 0) updatePadDisplay(); // clear message
+      }
+
+      // Pulse the pedestal ring
+      if (pedestalRingMesh && pedestalRingMesh.visible) {
+        ringPulseTime += dt;
+        pedestalRingMesh.material.opacity = 0.5 + 0.45 * Math.sin(ringPulseTime * 3.5);
+        pedestalRingMesh.scale.setScalar(1.5 + 0.06 * Math.sin(ringPulseTime * 3.5));
+      }
+
+      renderer.render(scene, camera);
+    }
+
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+  </script>
+</body>
+</html>
